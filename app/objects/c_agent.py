@@ -94,10 +94,10 @@ class Agent(FirstClassObjectInterface, BaseObject):
         untrusted_buffer = int(self.get_config(name='agents', prop='untrusted_timer'))
         time_diff = (now - self.last_seen).total_seconds()
         expired = time_diff > int(self.sleep_max) + untrusted_buffer
-        if self._marked_for_stop:
+        if getattr(self, '_marked_for_stop', False):
             # If agent hasn't received the stop instruction yet in a beacon response, it's still pending stop
             # Otherwise, if agent has received the stop instruction or takes too long to beacon back, mark as dead
-            return 'dead' if self._stop_delivered or expired else 'pending kill'
+            return 'dead' if getattr(self, '_stop_delivered', False) or expired else 'pending kill'
         else:
             # If agent hasn't beaconed in since max beacon time + untrusted timer, mark as dead
             return 'dead' if expired else 'alive'
@@ -233,7 +233,7 @@ class Agent(FirstClassObjectInterface, BaseObject):
             self.update('executors', kwargs.get('executors'))
 
         # Check if agent has been marked to stop
-        if self._marked_for_stop and not self._stop_delivered:
+        if getattr(self, '_marked_for_stop', False) and not getattr(self, '_stop_delivered', False):
             self._stop_delivered = True
 
     async def gui_modification(self, **kwargs):
