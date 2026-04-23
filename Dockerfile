@@ -40,7 +40,7 @@ COPY --from=ui-build /usr/src/app/plugins/magma/dist /usr/src/app/plugins/magma/
 # From https://docs.docker.com/build/building/best-practices/
 # Install caldera dependencies
 RUN apt-get update && \
-apt-get --no-install-recommends -y install git curl unzip python3-dev python3-pip mingw-w64 zlib1g gcc && \
+apt-get --no-install-recommends -y install git curl unzip python3-dev python3-pip mingw-w64 zlib1g gcc haproxy openssl && \
 rm -rf /var/lib/apt/lists/*
 
 # Install Golang from source (apt version is too out-of-date)
@@ -67,8 +67,6 @@ RUN pip3 install --break-system-packages --no-cache-dir -r requirements.txt
 RUN if [ ! -d "/usr/src/app/plugins/atomic/data/atomic-red-team" ] && [ "$VARIANT" = "full" ]; then   \
         git clone --depth 1 https://github.com/redcanaryco/atomic-red-team.git \
             /usr/src/app/plugins/atomic/data/atomic-red-team;                  \
-    else \
-        sed -i '/\- atomic/d' conf/default.yml; \
 fi
 
 # For offline emu
@@ -94,6 +92,14 @@ RUN cd /usr/src/app/plugins/sandcat; ./update-agents.sh
 # Make sure emu can always be used in container (even if not enabled right now)
 RUN cd /usr/src/app/plugins/emu; \
     pip3 install --break-system-packages -r requirements.txt
+
+# SSL Setup for HAProxy
+RUN openssl req -x509 -newkey rsa:4096 -keyout plugins/ssl/conf/private.key -out plugins/ssl/conf/public.crt -days 365 -nodes -subj "/C=US/ST=VA/L=McLean/O=Mitre/OU=Caldera/CN=mycaldera.caldera" && \
+    cat plugins/ssl/conf/public.crt plugins/ssl/conf/private.key > plugins/ssl/conf/certificate.pem
+
+# Configure HAProxy
+RUN cp plugins/ssl/templates/haproxy.conf conf/ && \
+    sed -i 's#bind \*:8443 ssl crt plugins/ssl/conf/insecure_certificate.pem#bind \*:8443 ssl crt plugins/ssl/conf/certificate.pem#' conf/haproxy.conf
 
 STOPSIGNAL SIGINT
 

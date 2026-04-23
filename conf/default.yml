@@ -1,5 +1,5 @@
 ability_refresh: 60
-client_max_size_mb: 1
+client_max_size_mb: 50
 api_upload_max_size_mb: 100
 api_key_blue: BLUEADMIN123
 api_key_red: ADMIN123
@@ -42,6 +42,8 @@ plugins:
 - sandcat
 - stockpile
 - training
+- emu
+- ssl
 port: 8888
 reachable_host_traits:
 - remote.host.fqdn
