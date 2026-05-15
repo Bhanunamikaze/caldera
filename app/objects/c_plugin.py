@@ -49,11 +49,13 @@ class Plugin(FirstClassObjectInterface, BaseObject):
         return existing
 
     def load_plugin(self):
+        plugin = self._load_module()
+        if plugin is None:
+            return False
         try:
-            plugin = self._load_module()
             self.description = plugin.description
             self.address = plugin.address
-            self.access = getattr(self._load_module(), 'access', self.Access.APP)
+            self.access = getattr(plugin, 'access', self.Access.APP)
             return True
         except Exception as e:
             logging.error('Error loading plugin=%s, %s' % (self.name, e))
@@ -63,8 +65,10 @@ class Plugin(FirstClassObjectInterface, BaseObject):
         try:
             if os.path.exists('plugins/%s/data' % self.name.lower()):
                 self.data_dir = 'plugins/%s/data' % self.name.lower()
-            plugin = self._load_module().enable
-            await plugin(services)
+            module = self._load_module()
+            if module is None:
+                return
+            await module.enable(services)
             self.enabled = True
         except Exception as e:
             logging.error('Error enabling plugin=%s, %s' % (self.name, e))
