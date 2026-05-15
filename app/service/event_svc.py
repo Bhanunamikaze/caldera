@@ -80,9 +80,14 @@ class EventService(EventServiceInterface, BaseService):
             asyncio.get_event_loop().create_task(self.notify_global_event_listeners('/'.join([exchange, queue]),
                                                                                     **callback_kwargs))
         d = json.dumps(callback_kwargs)
-        async with websockets.connect(uri) as websocket:
-            asyncio.get_event_loop().create_task(self.handle_exceptions(websocket.send(d)))
-            await asyncio.sleep(0)  # yield control to event loop
+        try:
+            async with websockets.connect(uri, open_timeout=5) as websocket:
+                asyncio.get_event_loop().create_task(self.handle_exceptions(websocket.send(d)))
+                await asyncio.sleep(0)  # yield control to event loop
+        except (asyncio.TimeoutError, OSError, websockets.exceptions.WebSocketException) as e:
+            # The internal event-bus websocket is best-effort; never let a delivery failure
+            # tear down the caller (e.g. Operation.run, knowledge_svc.add_fact).
+            self.log.warning("Failed to publish event %s/%s: %s", exchange, queue, e)
 
 
 class _Handle:

@@ -255,10 +255,14 @@ class Operation(FirstClassObjectInterface, BaseObject):
         :return: None
         """
         for link_id in link_ids:
-            link = [link for link in self.chain if link.id == link_id][0]
+            link = next((lk for lk in self.chain if lk.id == link_id), None)
+            if link is None:
+                continue
             if link.can_ignore():
                 self.add_ignored_link(link.id)
-            member = [member for member in self.agents if member.paw == link.paw][0]
+            member = next((m for m in self.agents if m.paw == link.paw), None)
+            if member is None:
+                continue
             while not (link.finish or link.can_ignore()):
                 await asyncio.sleep(5)
                 if not member.trusted:

@@ -37,7 +37,14 @@ class LearningService(LearningServiceInterface, BaseService):
         self.model = set(self.model)
 
     async def learn(self, facts, link, blob, operation=None):
-        decoded_blob = b64decode(blob).decode('utf-8')
+        raw = b64decode(blob)
+        # Agents (especially PowerShell on Windows) may return output encoded as UTF-16
+        # rather than UTF-8 — detect via BOM, otherwise fall back to lossy UTF-8 decoding
+        # so parsers still get a usable string instead of raising and killing the task.
+        if raw.startswith(b'\xff\xfe') or raw.startswith(b'\xfe\xff'):
+            decoded_blob = raw.decode('utf-16', errors='replace')
+        else:
+            decoded_blob = raw.decode('utf-8', errors='replace')
 
         found_facts = []
         for parser in self.parsers:
