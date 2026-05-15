@@ -67,7 +67,8 @@ class AppService(AppServiceInterface, BaseService):
     async def find_link(self, unique):
         operations = await self.get_service('data_svc').locate('operations')
         agents = await self.get_service('data_svc').locate('agents')
-        return self._check_links_for_match(unique, [op.chain for op in operations] + [a.links for a in agents])
+        link_groups = [op.chain for op in operations] + [a.links for a in agents]
+        return await self.loop.run_in_executor(None, self._check_links_for_match, unique, link_groups)
 
     async def find_op_with_link(self, link_id):
         """
@@ -75,10 +76,10 @@ class AppService(AppServiceInterface, BaseService):
         operations first.
         """
         operations = await self.get_service('data_svc').locate('operations', match=dict(state='running'))
-        op = next((o for o in operations if o.has_link(link_id)), None)
+        op = await self.loop.run_in_executor(None, self._find_op_with_link, operations, link_id)
         if not op:
             operations = await self.get_service('data_svc').locate('operations', match=dict())
-            op = next((o for o in operations if o.has_link(link_id)), None)
+            op = await self.loop.run_in_executor(None, self._find_op_with_link, operations, link_id)
         return op
 
     async def run_scheduler(self):
@@ -241,12 +242,13 @@ class AppService(AppServiceInterface, BaseService):
     async def _write_reports(self):
         file_svc = self.get_service('file_svc')
         r_dir = await file_svc.create_exfil_sub_directory('%s/reports' % self.get_config('reports_dir'))
-        report = json.dumps(dict(self.get_service('contact_svc').report)).encode()
+        report = await self.loop.run_in_executor(None, lambda: json.dumps(dict(self.get_service('contact_svc').report)).encode())
         await file_svc.save_file('contact_reports', report, r_dir)
         for op in await self.get_service('data_svc').locate('operations'):
-            report = json.dumps(await op.report(self.get_service('file_svc'), self.get_service('data_svc')))
+            operation_report = await op.report(self.get_service('file_svc'), self.get_service('data_svc'))
+            report = await self.loop.run_in_executor(None, lambda: json.dumps(operation_report).encode())
             if report:
-                await file_svc.save_file('operation_%s' % op.id, report.encode(), r_dir)
+                await file_svc.save_file('operation_%s' % op.id, report, r_dir)
 
     @staticmethod
     def _check_links_for_match(unique, links):
@@ -254,3 +256,7 @@ class AppService(AppServiceInterface, BaseService):
             exists = next((link for link in ll if link.unique == str(unique)), None)
             if exists:
                 return exists
+
+    @staticmethod
+    def _find_op_with_link(operations, link_id):
+        return next((o for o in operations if o.has_link(link_id)), None)

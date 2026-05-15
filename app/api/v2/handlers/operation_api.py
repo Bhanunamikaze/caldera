@@ -46,7 +46,7 @@ class OperationApi(BaseObjectApi):
                                      description='The response is a list of all operations.')
     async def get_operations(self, request: web.Request):
         operations = await self.get_all_objects(request)
-        return web.json_response(operations)
+        return await self._json_response_async(operations)
 
     @aiohttp_apispec.docs(tags=['operations'],
                           summary='Retrieve an operation by operation id',
@@ -65,7 +65,7 @@ class OperationApi(BaseObjectApi):
                                      description='The response is the operation with the specified id, if any.')
     async def get_operation_by_id(self, request: web.Request):
         operation = await self.get_object(request)
-        return web.json_response(operation)
+        return await self._json_response_async(operation)
 
     @aiohttp_apispec.docs(tags=['operations'],
                           summary='Retrieve operations (alternate)',
@@ -89,7 +89,7 @@ class OperationApi(BaseObjectApi):
             for prop in remove_props:
                 op.pop(prop, None)
             operations_mod.append(op)
-        return web.json_response(operations_mod)
+        return await self._json_response_async(operations_mod)
 
     @aiohttp_apispec.docs(tags=['operations'],
                           summary='Create a new Caldera operation record',
@@ -162,7 +162,7 @@ class OperationApi(BaseObjectApi):
         access = await self.get_request_permissions(request)
         output = await self._read_output_parameter_(request)
         report = await self._api_manager.get_operation_report(operation_id, access, output)
-        return web.json_response(report, dumps=lambda obj: json.dumps(obj, ensure_ascii=True, default=str))
+        return await self._json_response_async(report)
 
     @aiohttp_apispec.docs(tags=['operations'],
                           summary='Get Operation Event Logs',
@@ -184,7 +184,7 @@ class OperationApi(BaseObjectApi):
         access = await self.get_request_permissions(request)
         output = await self._read_output_parameter_(request)
         report = await self._api_manager.get_operation_event_logs(operation_id, access, output)
-        return web.json_response(report, dumps=lambda obj: json.dumps(obj, ensure_ascii=True, default=str))
+        return await self._json_response_async(report)
 
     @aiohttp_apispec.docs(tags=['operations'],
                           summary='Get Links from Operation',
@@ -203,7 +203,7 @@ class OperationApi(BaseObjectApi):
         operation_id = request.match_info.get('id')
         access = await self.get_request_permissions(request)
         links = await self._api_manager.get_operation_links(operation_id, access)
-        return web.json_response(links)
+        return await self._json_response_async(links)
 
     @aiohttp_apispec.docs(tags=['operations'],
                           summary='Retrieve a specified link from an operation',
@@ -234,7 +234,7 @@ class OperationApi(BaseObjectApi):
         link_id = request.match_info.get('link_id')
         access = await self.get_request_permissions(request)
         link = await self._api_manager.get_operation_link(operation_id, link_id, access)
-        return web.json_response(link)
+        return await self._json_response_async(link)
 
     @aiohttp_apispec.docs(tags=['operations'],
                           summary='Retrieve the result of a link',
@@ -263,7 +263,7 @@ class OperationApi(BaseObjectApi):
         link_id = request.match_info.get('link_id')
         access = await self.get_request_permissions(request)
         result = await self._api_manager.get_operation_link_result(operation_id, link_id, access)
-        return web.json_response(result)
+        return await self._json_response_async(result)
 
     @aiohttp_apispec.docs(tags=['operations'],
                           summary='Update the specified link within an operation',
@@ -385,3 +385,9 @@ class OperationApi(BaseObjectApi):
         if raw_body:
             output = json.loads(raw_body).get('enable_agent_output', False)
         return output
+
+    @staticmethod
+    async def _json_response_async(data):
+        loop = asyncio.get_event_loop()
+        body = await loop.run_in_executor(None, lambda: json.dumps(data, ensure_ascii=True, default=str))
+        return web.Response(text=body, content_type='application/json')

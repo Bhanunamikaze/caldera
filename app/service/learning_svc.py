@@ -1,6 +1,8 @@
+import asyncio
 import itertools
 import glob
 import re
+import threading
 from base64 import b64decode
 from importlib import import_module
 
@@ -16,6 +18,7 @@ class LearningService(LearningServiceInterface, BaseService):
         self.log = self.add_service('learning_svc', self)
         self.model = set()
         self.parsers = self.add_parsers('app/learning')
+        self._parser_lock = threading.Lock()
         self.re_variable = re.compile(r'#{(.*?)}', flags=re.DOTALL)
         self.log.debug('Loaded %d parsers' % len(self.parsers))
 
@@ -37,6 +40,12 @@ class LearningService(LearningServiceInterface, BaseService):
         self.model = set(self.model)
 
     async def learn(self, facts, link, blob, operation=None):
+        loop = asyncio.get_event_loop()
+        found_facts = await loop.run_in_executor(None, self._parse_blob, blob)
+        await update_scores(operation=None, increment=len(found_facts), used=facts, facts=link.facts)
+        await self._store_results(link, found_facts, operation)
+
+    def _parse_blob(self, blob):
         raw = b64decode(blob)
         # Agents (especially PowerShell on Windows) may return output encoded as UTF-16
         # rather than UTF-8 — detect via BOM, otherwise fall back to lossy UTF-8 decoding
@@ -47,14 +56,14 @@ class LearningService(LearningServiceInterface, BaseService):
             decoded_blob = raw.decode('utf-8', errors='replace')
 
         found_facts = []
-        for parser in self.parsers:
-            try:
-                for fact in parser.parse(decoded_blob):
-                    found_facts.append(fact)
-            except Exception as e:
-                self.log.error(e)
-        await update_scores(operation=None, increment=len(found_facts), used=facts, facts=link.facts)
-        await self._store_results(link, found_facts, operation)
+        with self._parser_lock:
+            for parser in self.parsers:
+                try:
+                    for fact in parser.parse(decoded_blob):
+                        found_facts.append(fact)
+                except Exception as e:
+                    self.log.error(e)
+        return found_facts
 
     async def _store_results(self, link, facts, operation=None):
         facts_covered = []

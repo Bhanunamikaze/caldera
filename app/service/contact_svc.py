@@ -72,6 +72,7 @@ class ContactService(ContactServiceInterface, BaseService):
                 await self.get_service('event_svc').fire_event(exchange='link', queue='completed', agent=agent.display,
                                                                pid=result['pid'], link_id=result['id'],
                                                                access=access.value)
+                await asyncio.sleep(0)
             if results:
                 return agent, []
             return agent, await self._get_instructions(agent)
@@ -124,12 +125,7 @@ class ContactService(ContactServiceInterface, BaseService):
                 if result.output or result.stderr:
                     link.output = True
                     result.output = await self._postprocess_link_result(result.output, link)
-                    command_results = json.dumps(dict(
-                        stdout=self.decode_bytes(result.output, strip_newlines=False),
-                        stderr=self.decode_bytes(result.stderr, strip_newlines=False),
-                        exit_code=result.exit_code))
-                    encoded_command_results = self.encode_string(command_results)
-                    self.get_service('file_svc').write_result_file(result.id, encoded_command_results)
+                    await self._write_result_file_async(result.id, result.output, result.stderr, result.exit_code)
                     operation = await self.get_service('app_svc').find_op_with_link(result.id)
                     if not operation and not link.executor.parsers:
                         agent = await self.get_service('data_svc').locate('agents', dict(paw=link.paw))
@@ -144,14 +140,21 @@ class ContactService(ContactServiceInterface, BaseService):
                         loop.create_task(self.get_service('learning_svc').learn(all_facts, link, result.output,
                                                                                 operation))
             else:
-                command_results = json.dumps(dict(
-                    stdout=self.decode_bytes(result.output, strip_newlines=False),
-                    stderr=self.decode_bytes(result.stderr, strip_newlines=False),
-                    exit_code=result.exit_code))
-                encoded_command_results = self.encode_string(command_results)
-                self.get_service('file_svc').write_result_file(result.id, encoded_command_results)
+                await self._write_result_file_async(result.id, result.output, result.stderr, result.exit_code)
         except Exception as e:
             self.log.exception(f'Unexpected error occurred while saving link - {e}')
+
+    async def _write_result_file_async(self, result_id, output, stderr, exit_code):
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, self._write_result_file, result_id, output, stderr, exit_code)
+
+    def _write_result_file(self, result_id, output, stderr, exit_code):
+        command_results = json.dumps(dict(
+            stdout=self.decode_bytes(output, strip_newlines=False),
+            stderr=self.decode_bytes(stderr, strip_newlines=False),
+            exit_code=exit_code))
+        encoded_command_results = self.encode_string(command_results)
+        self.get_service('file_svc').write_result_file(result_id, encoded_command_results)
 
     async def _postprocess_link_result(self, result, link):
         if link.ability.HOOKS and link.executor.name in link.ability.HOOKS:

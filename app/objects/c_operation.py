@@ -24,6 +24,7 @@ from app.utility.base_planning_svc import BasePlanningService
 from app.utility.base_service import BaseService
 
 NO_PREVIOUS_STATE = object()
+_JSON_CONTROL_CHARS = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f]')
 
 
 class InvalidOperationStateError(Exception):
@@ -293,17 +294,31 @@ class Operation(FirstClassObjectInterface, BaseObject):
     async def get_active_agent_by_paw(self, paw):
         return [a for a in await self.active_agents() if a.paw == paw]
 
-    async def get_skipped_abilities_by_agent(self, data_svc):
+    async def get_skipped_abilities_by_agent(self, data_svc, op_fact_traits=None):
         abilities_by_agent = await self._get_all_possible_abilities_by_agent(data_svc)
+        if op_fact_traits is None:
+            op_fact_traits = [f.trait for f in await self.all_facts()]
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None,
+            self._build_skipped_abilities_by_agent,
+            abilities_by_agent,
+            list(self.agents),
+            list(self.chain),
+            op_fact_traits,
+            self.state
+        )
+
+    def _build_skipped_abilities_by_agent(self, abilities_by_agent, agents, chain, op_fact_traits, state):
         skipped_abilities = []
-        for agent in self.agents:
+        for agent in agents:
             agent_skipped = defaultdict(dict)
             agent_executors = agent.executors
-            agent_ran = set([link.ability.ability_id for link in self.chain if link.paw == agent.paw and link.finish])
-            for ab in abilities_by_agent[agent.paw]['all_abilities']:
+            agent_ran = set([link.ability.ability_id for link in chain if link.paw == agent.paw and link.finish])
+            for ab in abilities_by_agent.get(agent.paw, {'all_abilities': []})['all_abilities']:
                 skipped = self._check_reason_skipped(agent=agent, ability=ab, agent_executors=agent_executors,
-                                                     op_facts=[f.trait for f in await self.all_facts()],
-                                                     state=self.state, agent_ran=agent_ran)
+                                                     op_facts=op_fact_traits, state=state, agent_ran=agent_ran,
+                                                     chain=chain)
                 if skipped:
                     if agent_skipped[skipped['ability_id']]:
                         if agent_skipped[skipped['ability_id']]['reason_id'] > skipped['reason_id']:
@@ -315,13 +330,35 @@ class Operation(FirstClassObjectInterface, BaseObject):
 
     async def report(self, file_svc, data_svc, output=False):
         try:
-            report = dict(name=self.name, host_group=[a.display for a in self.agents],
+            facts = await self.all_facts()
+            skipped_abilities = await self.get_skipped_abilities_by_agent(
+                data_svc,
+                op_fact_traits=[f.trait for f in facts]
+            )
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(
+                None,
+                self._build_report,
+                file_svc,
+                facts,
+                skipped_abilities,
+                list(self.agents),
+                list(self.chain),
+                output
+            )
+        except Exception:
+            logging.error('Error generating operation report (%s)' % self.name, exc_info=True)
+            raise
+
+    def _build_report(self, file_svc, facts, skipped_abilities, agents, steps, output=False):
+        try:
+            report = dict(name=self.name, host_group=[a.display for a in agents],
                           start=self.start.strftime(self.TIME_FORMAT),
                           steps=[], finish=self.finish, planner=self.planner.name, adversary=self.adversary.display,
                           jitter=self.jitter, objectives=self.objective.display,
-                          facts=[f.display for f in await self.all_facts()])
-            agents_steps = {a.paw: {'steps': []} for a in self.agents}
-            for step in self.chain:
+                          facts=[f.display for f in facts])
+            agents_steps = {a.paw: {'steps': []} for a in agents}
+            for step in steps:
                 step_report = dict(link_id=step.id,
                                    ability_id=step.ability.ability_id,
                                    command=self._sanitize_for_json(self.decode_bytes(step.command)),
@@ -348,7 +385,7 @@ class Operation(FirstClassObjectInterface, BaseObject):
                     step_report['agent_reported_time'] = step.agent_reported_time.strftime(self.TIME_FORMAT)
                 agents_steps.setdefault(step.paw, {'steps': []})['steps'].append(step_report)
             report['steps'] = agents_steps
-            report['skipped_abilities'] = await self.get_skipped_abilities_by_agent(data_svc)
+            report['skipped_abilities'] = skipped_abilities
             return report
         except Exception:
             logging.error('Error generating operation report (%s)' % self.name, exc_info=True)
@@ -356,12 +393,30 @@ class Operation(FirstClassObjectInterface, BaseObject):
 
     async def event_logs(self, file_svc, data_svc, output=False):
         # Ignore discarded / high visibility links that did not actually run.
+        steps = [step for step in self.chain if not step.can_ignore()]
+        agent_metadata_by_paw = {}
+        for paw in {step.paw for step in steps}:
+            agent_metadata_by_paw[paw] = await self._get_agent_info_for_event_log(paw, data_svc)
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None,
+            self._build_event_logs,
+            steps,
+            file_svc,
+            agent_metadata_by_paw,
+            output
+        )
+
+    def _build_event_logs(self, steps, file_svc, agent_metadata_by_paw, output=False):
         event_logs = []
-        for step in self.chain:
-            if step.can_ignore():
-                continue
+        for step in steps:
             try:
-                event_logs.append(await self._convert_link_to_event_log(step, file_svc, data_svc, output=output))
+                event_logs.append(self._convert_link_to_event_log_sync(
+                    step,
+                    file_svc,
+                    agent_metadata_by_paw.get(step.paw, {}),
+                    output=output
+                ))
             except Exception:
                 logging.warning('Error converting link %s to event log for operation %s, skipping',
                                 step.id, self.name, exc_info=True)
@@ -402,6 +457,18 @@ class Operation(FirstClassObjectInterface, BaseObject):
         self.objective = deepcopy(obj[0])
 
     async def _convert_link_to_event_log(self, link, file_svc, data_svc, output=False):
+        agent_metadata = await self._get_agent_info_for_event_log(link.paw, data_svc)
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None,
+            self._convert_link_to_event_log_sync,
+            link,
+            file_svc,
+            agent_metadata,
+            output
+        )
+
+    def _convert_link_to_event_log_sync(self, link, file_svc, agent_metadata, output=False):
         event_dict = dict(command=self._sanitize_for_json(self.decode_bytes(link.command)),
                           plaintext_command=self._sanitize_for_json(self.decode_bytes(link.plaintext_command)),
                           delegated_timestamp=link.decide.strftime(self.TIME_FORMAT),
@@ -411,7 +478,7 @@ class Operation(FirstClassObjectInterface, BaseObject):
                           platform=link.executor.platform,
                           executor=link.executor.name,
                           pid=link.pid,
-                          agent_metadata=await self._get_agent_info_for_event_log(link.paw, data_svc),
+                          agent_metadata=agent_metadata,
                           ability_metadata=self._get_ability_metadata_for_event_log(link.ability),
                           operation_metadata=self._get_operation_metadata_for_event_log(),
                           attack_metadata=self._get_attack_metadata_for_event_log(link.ability))
@@ -513,10 +580,11 @@ class Operation(FirstClassObjectInterface, BaseObject):
                     entry['all_abilities'].extend(matching_abilities)
         return abilities_by_agent
 
-    def _check_reason_skipped(self, agent, ability, op_facts, state, agent_executors, agent_ran):
+    def _check_reason_skipped(self, agent, ability, op_facts, state, agent_executors, agent_ran, chain=None):
         if ability.ability_id in agent_ran:
             return
 
+        chain = self.chain if chain is None else chain
         valid_executors = ability.find_executors(agent_executors, agent.platform)
 
         fact_dependency_fulfilled = False
@@ -524,7 +592,7 @@ class Operation(FirstClassObjectInterface, BaseObject):
             facts = re.findall(BasePlanningService.re_variable, executor.test) if executor.command else []
             if not facts or all(fact in op_facts for fact in facts):
                 fact_dependency_fulfilled = True
-        associated_links = set([link.id for link in self.chain if link.paw == agent.paw
+        associated_links = set([link.id for link in chain if link.paw == agent.paw
                                 and link.ability.ability_id == ability.ability_id])
 
         if agent.platform == 'unknown':
@@ -564,16 +632,16 @@ class Operation(FirstClassObjectInterface, BaseObject):
         if not isinstance(s, str):
             return s
         try:
-            # Round-trip through utf-8 to normalize surrogates and bad chars
-            sanitized = s.encode('utf-8', errors='surrogatepass').decode('utf-8', errors='replace')
-            # Strip null bytes and other control characters (except tab, newline, carriage return)
-            sanitized = ''.join(c if c in ('\t', '\n', '\r') or (c >= ' ' or ord(c) > 127) else '\ufffd' for c in sanitized)
-            # Final verification: ensure json.dumps won't choke
-            json.dumps(sanitized)
-            return sanitized
+            if _JSON_CONTROL_CHARS.search(s):
+                s = _JSON_CONTROL_CHARS.sub('\ufffd', s)
+            json.dumps(s)
+            return s
         except Exception:
-            # Last resort: ASCII-only representation
-            return s.encode('ascii', errors='replace').decode('ascii')
+            try:
+                sanitized = s.encode('utf-8', errors='replace').decode('utf-8', errors='replace')
+                return _JSON_CONTROL_CHARS.sub('\ufffd', sanitized)
+            except Exception:
+                return s.encode('ascii', errors='replace').decode('ascii')
 
     def _get_operation_metadata_for_event_log(self):
         return dict(operation_name=self._sanitize_for_json(self.name),

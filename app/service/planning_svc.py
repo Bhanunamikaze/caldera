@@ -1,3 +1,5 @@
+import asyncio
+
 from app.objects.secondclass.c_link import Link
 from app.service.interfaces.i_planning_svc import PlanningServiceInterface
 from app.utility.base_planning_svc import BasePlanningService
@@ -43,6 +45,7 @@ class PlanningService(PlanningServiceInterface, BasePlanningService):
                 break
             for s_link in links:
                 l_id = await operation.apply(s_link)
+                await asyncio.sleep(0)
                 if batch:
                     l_ids.append(l_id)
                 else:
@@ -133,6 +136,7 @@ class PlanningService(PlanningServiceInterface, BasePlanningService):
             if publish_transitions:
                 await _publish_bucket_transition(planner.next_bucket)
             await getattr(planner, planner.next_bucket)()
+            await asyncio.sleep(0)
             await self.update_stopping_condition_met(planner, planner.operation)
         if publish_transitions:
             await _publish_bucket_transition("(planner completed)")
@@ -175,6 +179,7 @@ class PlanningService(PlanningServiceInterface, BasePlanningService):
             agent_links = []
             for agent in operation.agents:
                 agent_links.append(await self.generate_and_trim_links(agent, operation, abilities, trim))
+                await asyncio.sleep(0)
             links = await self._remove_links_of_duplicate_singletons(agent_links)
         self.log.debug('Generated %s usable links' % (len(links)))
         return await self.sort_links(links)

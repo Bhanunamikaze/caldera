@@ -54,17 +54,22 @@ class OperationApiManager(BaseApiManager):
 
     async def get_operation_links(self, operation_id: str, access: dict):
         operation = await self.get_operation_object(operation_id, access)
-        links = [link.display for link in operation.chain]
-        return links
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, self._build_operation_links, operation)
 
     async def get_operation_link(self, operation_id: str, link_id: str, access: dict):
         operation = await self.get_operation_object(operation_id, access)
         link = self.search_operation_for_link(operation, link_id)
-        return link.display
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, lambda: link.display)
 
     async def get_operation_link_result(self, operation_id: str, link_id: str, access: dict):
         operation = await self.get_operation_object(operation_id, access)
         link = self.search_operation_for_link(operation, link_id)
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, self._read_operation_link_result, link_id, link)
+
+    def _read_operation_link_result(self, link_id: str, link: Link):
         try:
             result = self.services['file_svc'].read_result_file('%s' % link_id)
             return dict(link=link.display, result=result)
@@ -231,6 +236,10 @@ class OperationApiManager(BaseApiManager):
                 agents[paw] = tmp_agent
             agents[paw]['links'].append(link)
         return agents
+
+    @staticmethod
+    def _build_operation_links(operation: Operation):
+        return [link.display for link in operation.chain]
 
     async def get_hosts(self, operation: dict):
         hosts = {}

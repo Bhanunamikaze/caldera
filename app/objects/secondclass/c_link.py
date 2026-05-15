@@ -254,10 +254,16 @@ class Link(BaseObject):
         return task
 
     async def _parse_link_result(self, result, parser, source_facts):
-        blob = b64decode(result).decode('utf-8')
         parser_info = dict(module=parser.module, used_facts=self.used, mappers=parser.parserconfigs,
                            source_facts=source_facts)
-        p_inst = await self._load_module('Parser', parser_info)
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, self._parse_link_result_sync, result, parser_info)
+
+    @staticmethod
+    def _parse_link_result_sync(result, parser_info):
+        blob = b64decode(result).decode('utf-8')
+        module = import_module(parser_info['module'])
+        p_inst = getattr(module, 'Parser')(parser_info)
         return p_inst.parse(blob=blob)
 
     @staticmethod
