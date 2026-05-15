@@ -1,4 +1,3 @@
-import asyncio
 import json
 
 from aiohttp import web
@@ -20,7 +19,11 @@ class Contact(BaseWorld):
 
     async def _beacon(self, request):
         try:
-            profile = await self._read_profile(request)
+            # Beacon payloads are tiny — decoding inline beats the
+            # ~10-100µs run_in_executor scheduling overhead, and lower
+            # per-beacon latency reduces agent-side connection resets.
+            raw_body = await request.read()
+            profile = json.loads(self.contact_svc.decode_bytes(raw_body))
             profile['paw'] = profile.get('paw')
             profile['contact'] = profile.get('contact', self.name)
             agent, instructions = await self.contact_svc.handle_heartbeat(**profile)
@@ -34,18 +37,6 @@ class Contact(BaseWorld):
             if agent.executor_change_to_assign:
                 response['executor_change'] = agent.assign_pending_executor_change()
                 self.log.debug('Asking agent to update executor: %s', response.get('executor_change'))
-            return web.Response(text=await self._encode_response(response))
+            return web.Response(text=self.contact_svc.encode_string(json.dumps(response)))
         except Exception as e:
             self.log.error('Malformed beacon: %s' % e)
-
-    async def _read_profile(self, request):
-        raw_body = await request.read()
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self._decode_profile, raw_body)
-
-    def _decode_profile(self, raw_body):
-        return json.loads(self.contact_svc.decode_bytes(raw_body))
-
-    async def _encode_response(self, response):
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, lambda: self.contact_svc.encode_string(json.dumps(response)))
