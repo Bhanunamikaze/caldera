@@ -1,12 +1,20 @@
+import asyncio
 import copy
 import itertools
 import logging
-import pickle
 import re
 from base64 import b64decode
 
 from app.utility.base_service import BaseService
 from app.utility.rule_set import RuleSet
+
+
+# Yield to the event loop every Nth pickle/copy-round-trip inside the planner's
+# inner loops. add_test_variants and _trim_by_limit run with O(links * combos)
+# deepcopy work on the loop thread; without periodic yields, a single planning
+# step can hold the loop long enough to push every other request past HAProxy's
+# timeout and produce blanket 504s while an operation is running.
+_PLANNER_YIELD_EVERY = 32
 
 
 class BasePlanningService(BaseService):
@@ -117,12 +125,15 @@ class BasePlanningService(BaseService):
             if trim_missing_requirements:
                 combos = [combo for combo in combos if not await self._is_missing_requirements(link, combo, operation)]
 
-            for combo in combos:
+            for combo_idx, combo in enumerate(combos):
                 try:
                     copy_test = copy.copy(decoded_test)
                     variant, score, used = await self._build_single_test_variant(copy_test, combo, link.executor.name)
 
-                    copy_link = pickle.loads(pickle.dumps(link))    # nosec
+                    # deepcopy is ~10x faster than pickle.loads(pickle.dumps(...))
+                    # for objects of this shape, and avoids the per-attribute
+                    # protocol overhead of pickling Link's nested Ability/Executor.
+                    copy_link = copy.deepcopy(link)
                     copy_link.command = self.encode_string(variant)
                     copy_link.score = score
                     copy_link.used.extend(used)
@@ -130,6 +141,8 @@ class BasePlanningService(BaseService):
                     link_variants.append(copy_link)
                 except Exception as ex:
                     logging.error('Could not create test variant: %s.\nLink=%s' % (ex, link.__dict__))
+                if combo_idx and not combo_idx % _PLANNER_YIELD_EVERY:
+                    await asyncio.sleep(0)
 
         if trim_unset_variables:
             links = await self.remove_links_with_unset_variables(links)
@@ -280,7 +293,12 @@ class BasePlanningService(BaseService):
     async def _trim_by_limit(self, decoded_test, facts):
         limited_facts = []
         for limit in re.findall(self.re_limited, decoded_test):
-            limited = pickle.loads(pickle.dumps(facts))     # nosec
+            # Shallow-copy the fact list — _apply_limiter rebuilds it via sorted()
+            # / list-comprehensions on every call, so the inner code never mutates
+            # the list in place. The previous pickle round-trip was a deep-copy
+            # the planner didn't actually need, and it dominated CPU on the hot
+            # path while an operation was running.
+            limited = list(facts)
             trait = re.search(self.re_trait, limit).group(0).split('#{')[-1]
 
             limit_definitions = re.search(self.re_index, limit).group(0)
