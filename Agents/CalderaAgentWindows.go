@@ -338,7 +338,35 @@ func runInstruction(inst Instruction) ExecutionResult {
 	return out
 }
 
+// suppressErrorDialogs sets the process error mode so that Windows does NOT
+// pop a modal dialog when a child process (e.g. rundll32 loading a missing or
+// invalid DLL) hits a critical error. Without this, abilities that intentionally
+// load a payload via rundll32 — common in atomic-style abilities — will hang
+// the child process forever waiting for someone to click OK on a dialog the
+// non-interactive agent can never dismiss. The mode is inherited by child
+// processes (powershell.exe, cmd.exe, and in turn rundll32.exe).
+//
+// Flags used:
+//   SEM_FAILCRITICALERRORS (0x0001) — suppress critical-error dialogs
+//   SEM_NOGPFAULTERRORBOX  (0x0002) — suppress general-protection-fault dialogs
+//   SEM_NOOPENFILEERRORBOX (0x8000) — suppress "file not found" dialogs from OpenFile
+func suppressErrorDialogs() {
+	const (
+		SEM_FAILCRITICALERRORS = 0x0001
+		SEM_NOGPFAULTERRORBOX  = 0x0002
+		SEM_NOOPENFILEERRORBOX = 0x8000
+	)
+	kernel32 := windows.NewLazySystemDLL("kernel32.dll")
+	setErrorMode := kernel32.NewProc("SetErrorMode")
+	setErrorMode.Call(uintptr(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX))
+}
+
 func main() {
+	// Suppress Windows error dialogs before doing anything else — child
+	// processes inherit this mode, so rundll32 / regsvr32 / mshta failures
+	// will return an error code instead of hanging on a modal dialog.
+	suppressErrorDialogs()
+
 	// FEATURE: Added command-line flag parsing for debug, server, and insecure options.
 	serverURL := flag.String("server", "", "C2 server URL (e.g., http://127.0.0.1:8888)")
 	insecureFlag := flag.Bool("insecure", false, "Disable TLS certificate verification")
