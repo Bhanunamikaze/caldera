@@ -6,7 +6,7 @@ from aiohttp_jinja2 import render_template
 from ldap3.core.exceptions import LDAPAttributeError, LDAPException
 
 from app.service.interfaces.i_login_handler import LoginHandlerInterface
-from app.utility.config_util import verify_hash
+from app.utility.config_util import verify_hash_async
 
 HANDLER_NAME = 'Default Login Handler'
 
@@ -52,7 +52,7 @@ class DefaultLoginHandler(LoginHandlerInterface):
         user = user_map.get(username)
         if not user:
             return False
-        return verify_hash(user.password, password)
+        return await verify_hash_async(user.password, password)
 
     async def _ldap_login(self, username, password):
         server = ldap3.Server(self._ldap_config.get('server'))

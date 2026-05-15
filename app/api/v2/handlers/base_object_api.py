@@ -1,4 +1,5 @@
 import abc
+import asyncio
 import json
 
 from aiohttp import web
@@ -30,7 +31,17 @@ class BaseObjectApi(BaseApi):
         include = request['querystring'].get('include')
         exclude = request['querystring'].get('exclude')
 
-        return self._api_manager.find_and_dump_objects(self.ram_key, access, sort, include, exclude)
+        # find_and_dump_objects walks every object's marshmallow schema, which
+        # for long-running operations (chains of hundreds of links, each with
+        # facts/relationships) is CPU-heavy pure-Python work. Running it on the
+        # event loop starves every other coroutine — including unrelated UI
+        # polls and login requests — which surfaces upstream as 504 Gateway
+        # Timeouts. Offload to a thread so the loop stays responsive (GIL
+        # release between bytecodes still lets the loop progress).
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None, self._api_manager.find_and_dump_objects,
+            self.ram_key, access, sort, include, exclude)
 
     async def get_object(self, request: web.Request):
         data, access, obj_id, query, search = await self._parse_common_data_from_request(request)

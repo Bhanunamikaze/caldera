@@ -15,7 +15,7 @@ from app.service.interfaces.i_auth_svc import AuthServiceInterface
 from app.service.interfaces.i_login_handler import LoginHandlerInterface
 from app.service.login_handlers.default import DefaultLoginHandler
 from app.utility.base_service import BaseService
-from app.utility.config_util import verify_hash
+from app.utility.config_util import verify_hash_async
 
 
 HEADER_API_KEY = 'KEY'
@@ -163,13 +163,13 @@ class AuthService(AuthServiceInterface, BaseService):
                 # We ran into an unexpected exception when using the default login handler.
                 raise e
 
-    def request_has_valid_api_key(self, request):
+    async def request_has_valid_api_key(self, request):
         request_api_key = request.headers.get(HEADER_API_KEY)
         if request_api_key is None:
             return False
         for i in [CONFIG_API_KEY_RED, CONFIG_API_KEY_BLUE]:
             hashed_api_key = self.get_config(i)
-            if hashed_api_key is not None and verify_hash(hashed_api_key, request_api_key):
+            if hashed_api_key is not None and await verify_hash_async(hashed_api_key, request_api_key):
                 return True
         return False
 
@@ -184,7 +184,7 @@ class AuthService(AuthServiceInterface, BaseService):
 
     async def check_permissions(self, group, request):
         try:
-            if self.request_has_valid_api_key(request):
+            if await self.request_has_valid_api_key(request):
                 return True
             await check_permission(request, group)
         except (HTTPUnauthorized, HTTPForbidden):
@@ -195,14 +195,17 @@ class AuthService(AuthServiceInterface, BaseService):
         identity = await identity_policy.identify(request)
         if identity in self.user_map:
             return [self.Access[p.upper()] for p in self.user_map[identity].permissions]
-        elif verify_hash(self.get_config(CONFIG_API_KEY_RED), request.headers.get(HEADER_API_KEY)):
+        request_api_key = request.headers.get(HEADER_API_KEY)
+        if request_api_key is None:
+            return ()
+        if await verify_hash_async(self.get_config(CONFIG_API_KEY_RED), request_api_key):
             return self.Access.RED, self.Access.APP
-        elif verify_hash(self.get_config(CONFIG_API_KEY_BLUE), request.headers.get(HEADER_API_KEY)):
+        if await verify_hash_async(self.get_config(CONFIG_API_KEY_BLUE), request_api_key):
             return self.Access.BLUE, self.Access.APP
         return ()
 
     async def is_request_authenticated(self, request):
-        if self.request_has_valid_api_key(request):
+        if await self.request_has_valid_api_key(request):
             return True
         return await self.request_has_valid_user_session(request)
 

@@ -8,7 +8,44 @@ from app.service.interfaces.i_event_svc import EventServiceInterface
 from app.utility.base_service import BaseService
 
 
+class _InProcessSocket:
+    """Lightweight stand-in for a websocket connection, used to deliver an
+    event payload directly to an in-process subscriber. The previous design
+    opened a fresh localhost websocket connection on every fire_event call;
+    under load that buried the asyncio loop in handshakes and surfaced as
+    504 Gateway Timeouts on otherwise-unrelated HTTP requests.
+    """
+
+    def __init__(self, payload):
+        self._payload = payload
+        self._consumed = False
+
+    async def recv(self):
+        if self._consumed:
+            # Mimic a normal close once the single payload has been delivered.
+            raise websockets.exceptions.ConnectionClosedOK(None, None)
+        self._consumed = True
+        return self._payload
+
+    async def send(self, _message):
+        pass
+
+    async def close(self):
+        pass
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self._consumed:
+            raise StopAsyncIteration
+        self._consumed = True
+        return self._payload
+
+
 class EventService(EventServiceInterface, BaseService):
+
+    HANDLER_TIMEOUT_S = 30
 
     def __init__(self):
         self.log = self.add_service('event_svc', self)
@@ -17,6 +54,7 @@ class EventService(EventServiceInterface, BaseService):
         self.global_listeners = []
         self.default_exchange = 'caldera'
         self.default_queue = 'general'
+        self._cached_ws_handler = None
 
     async def observe_event(self, callback, exchange=None, queue=None):
         """
@@ -54,19 +92,20 @@ class EventService(EventServiceInterface, BaseService):
         :param event: Event string (i.e. '<exchange>/<queue>')
         :type event: str
         """
-        for c in self.global_listeners:
+        # Snapshot listeners — a callback may register/unregister during dispatch.
+        for c in list(self.global_listeners):
             try:
                 c(event, **callback_kwargs)
             except Exception as e:
-                self.log.error("Global callback error: {}".format(e), exc_info=True)
+                self.log.error("Global callback error: %s", e, exc_info=True)
 
     async def handle_exceptions(self, awaitable):
         try:
             return await awaitable
         except websockets.exceptions.ConnectionClosedOK:
-            pass  # No handler was registered for this event
+            pass
         except Exception as e:
-            self.log.error("WebSocket error: {}".format(e), exc_info=True)
+            self.log.error("WebSocket error: %s", e, exc_info=True)
 
     async def fire_event(self, exchange=None, queue=None, timestamp=True, **callback_kwargs):
         exchange = exchange or self.default_exchange
@@ -75,19 +114,54 @@ class EventService(EventServiceInterface, BaseService):
         if timestamp:
             metadata.update(dict(timestamp=datetime.now(timezone.utc).timestamp()))
         callback_kwargs.update(dict(metadata=metadata))
-        uri = '/'.join([self.ws_uri, exchange, queue])
+        event = '/'.join([exchange, queue])
         if self.global_listeners:
-            asyncio.get_event_loop().create_task(self.notify_global_event_listeners('/'.join([exchange, queue]),
-                                                                                    **callback_kwargs))
-        d = json.dumps(callback_kwargs)
+            asyncio.get_event_loop().create_task(
+                self.notify_global_event_listeners(event, **callback_kwargs))
+        # In-process dispatch — bypasses the localhost TCP loopback the bus
+        # originally relied on. The old path opened a brand-new websocket
+        # connection per event and awaited the handshake inline, which under
+        # any concurrent load (multiple agents, parallel logins, an active
+        # operation) starved the asyncio loop and turned every unrelated HTTP
+        # request into a 504.
+        await self._dispatch_in_process(event, json.dumps(callback_kwargs))
+
+    async def _dispatch_in_process(self, event, payload):
+        handler = await self._get_ws_handler()
+        if handler is None:
+            return
+        # Snapshot in case observe_event mutates handles during iteration.
+        matched = [h for h in list(handler.handles) if event.startswith(h.tag)]
+        for handle in matched:
+            asyncio.get_event_loop().create_task(
+                self._safe_dispatch(handler, handle, event, payload))
+
+    async def _safe_dispatch(self, handler, handle, event, payload):
+        socket = _InProcessSocket(payload)
         try:
-            async with websockets.connect(uri, open_timeout=5) as websocket:
-                asyncio.get_event_loop().create_task(self.handle_exceptions(websocket.send(d)))
-                await asyncio.sleep(0)  # yield control to event loop
-        except (asyncio.TimeoutError, OSError, websockets.exceptions.WebSocketException) as e:
-            # The internal event-bus websocket is best-effort; never let a delivery failure
-            # tear down the caller (e.g. Operation.run, knowledge_svc.add_fact).
-            self.log.warning("Failed to publish event %s/%s: %s", exchange, queue, e)
+            await asyncio.wait_for(
+                handle.run(socket, '/' + event, handler.services),
+                timeout=self.HANDLER_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            self.log.warning("Event handler '%s' timed out on %s", handle.tag, event)
+        except websockets.exceptions.ConnectionClosedOK:
+            pass
+        except Exception as e:
+            # One bad subscriber must not break delivery to the others or
+            # back-propagate into the publisher (e.g. Operation.run).
+            self.log.error("Event handler '%s' failed on %s: %s",
+                           handle.tag, event, e, exc_info=True)
+
+    async def _get_ws_handler(self):
+        if self._cached_ws_handler is not None:
+            return self._cached_ws_handler
+        try:
+            ws_contact = await self.contact_svc.get_contact('websocket')
+        except Exception as e:
+            self.log.debug("Could not fetch websocket contact: %s", e)
+            return None
+        self._cached_ws_handler = getattr(ws_contact, 'handler', None) if ws_contact else None
+        return self._cached_ws_handler
 
 
 class _Handle:

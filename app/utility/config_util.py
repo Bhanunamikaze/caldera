@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import pathlib
 import secrets
@@ -7,6 +8,11 @@ import yaml
 
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError, VerificationError, InvalidHashError
+
+
+# Reuse a single PasswordHasher — instantiation is non-trivial and we hit this
+# path on every authenticated API request.
+_PASSWORD_HASHER = PasswordHasher()
 
 
 CONFIG_MSG_TEMPLATE = jinja2.Template("""
@@ -38,14 +44,28 @@ def verify_hash(hash_val, target):
     """
     Returns True if the argon2 hash for the target matches hash_val, False otherwise.
     Returns False for None or non-string inputs.
+
+    NOTE: argon2 verification is intentionally CPU-heavy (~100-500ms per call).
+    Callers reachable from an asyncio handler MUST use ``verify_hash_async``
+    instead — otherwise every API request that carries a KEY header blocks
+    the event loop and turns concurrent requests into 504 Gateway Timeouts.
     """
     if not isinstance(hash_val, str) or not isinstance(target, str):
         return False
-    ph = PasswordHasher()
     try:
-        return ph.verify(hash_val, target)
+        return _PASSWORD_HASHER.verify(hash_val, target)
     except (VerifyMismatchError, VerificationError, InvalidHashError):
         return False
+
+
+async def verify_hash_async(hash_val, target):
+    """Run :func:`verify_hash` on the default executor so the asyncio loop
+    is free to service other requests while argon2 does its work.
+    """
+    if not isinstance(hash_val, str) or not isinstance(target, str):
+        return False
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, verify_hash, hash_val, target)
 
 
 def hash_config_creds(config):
@@ -54,7 +74,7 @@ def hash_config_creds(config):
     Modifies the configuration dictionary parameter.
     Returns True if any values were modified (hashed), False otherwise.
     """
-    ph = PasswordHasher()
+    ph = _PASSWORD_HASHER
     any_hashed = False
     for option in HASHED_OPTIONS:
         val = config.get(option, '')

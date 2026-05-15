@@ -1,3 +1,4 @@
+import asyncio
 import json
 import aiohttp_apispec
 
@@ -77,9 +78,13 @@ class OperationApi(BaseObjectApi):
     async def get_operations_summary(self, request: web.Request):
         remove_props = ['chain', 'host_group', 'source', 'visibility']
         operations = await self.get_all_objects(request)
+        loop = asyncio.get_event_loop()
         operations_mod = []
         for op in operations:
-            op['agents'] = self._api_manager.get_agents(op)
+            # get_agents walks the (already-dumped) chain and pulls each
+            # agent's display — also pure-Python CPU. Yield the loop between
+            # operations so a long list doesn't bury other requests.
+            op['agents'] = await loop.run_in_executor(None, self._api_manager.get_agents, op)
             op['hosts'] = await self._api_manager.get_hosts(op)
             for prop in remove_props:
                 op.pop(prop, None)
