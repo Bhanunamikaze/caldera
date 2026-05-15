@@ -67,7 +67,11 @@ class AppService(AppServiceInterface, BaseService):
     async def find_link(self, unique):
         operations = await self.get_service('data_svc').locate('operations')
         agents = await self.get_service('data_svc').locate('agents')
-        link_groups = [op.chain for op in operations] + [a.links for a in agents]
+        # Snapshot each chain/links list so the executor thread can iterate
+        # safely; the asyncio loop continues mutating op.chain / a.links
+        # concurrently while operations run, and handing the live references
+        # to the executor risks RuntimeError mid-iteration under load.
+        link_groups = [list(op.chain) for op in operations] + [list(a.links) for a in agents]
         return await self.loop.run_in_executor(None, self._check_links_for_match, unique, link_groups)
 
     async def find_op_with_link(self, link_id):
