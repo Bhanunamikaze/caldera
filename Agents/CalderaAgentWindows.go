@@ -1,3 +1,5 @@
+//go:build windows
+
 package main
 
 import (
@@ -113,13 +115,18 @@ const (
 	httpTLSHandshakeTimeout  = 10 * time.Second
 	httpResponseHeaderTimout = 60 * time.Second
 	httpIdleConnTimeout      = 90 * time.Second
-	maxCapturedOutputBytes   = 512 << 10 // 512 KiB cap on per-stream captured output
-	reconnectBaseDelay       = 5 * time.Second
-	reconnectMaxDelay        = 60 * time.Second
-	defaultMaxTimeout        = 5 * time.Minute
-	maxPayloadBytes          = 100 << 20 // 100 MB cap on payload downloads
-	maxBeaconResponseBytes   = 10 << 20  // 10 MB cap on beacon response body
-	maxDrainBytes            = 1 << 20   // 1 MB cap when draining unused response bodies
+	// Per-stream output cap. Tuned high so legitimate large outputs
+	// (file dumps, recursive listings, captured EDR logs etc.) are not
+	// truncated. Beyond this the truncation marker kicks in.
+	maxCapturedOutputBytes = 64 << 20 // 64 MiB per stdout / stderr stream
+	reconnectBaseDelay     = 5 * time.Second
+	reconnectMaxDelay      = 60 * time.Second
+	defaultMaxTimeout      = 10 * time.Minute
+	// Payload download from server. Some atomic abilities ship tens of MB
+	// of binaries — keep this generous so they fit without question.
+	maxPayloadBytes        = 1 << 30 // 1 GiB
+	maxBeaconResponseBytes = 256 << 20 // 256 MiB cap on beacon response body
+	maxDrainBytes          = 4 << 20   // 4 MiB cap when draining unused response bodies
 )
 
 // recoverAsError converts a panic into a returned error. Used to keep the
