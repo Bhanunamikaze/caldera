@@ -33,7 +33,12 @@ class AppService(AppServiceInterface, BaseService):
     def __init__(self, application):
         self.application = application
         self.log = self.add_service('app_svc', self)
-        self.loop = asyncio.get_event_loop()
+        # Do NOT cache the event loop here. AppService is constructed before
+        # aiohttp finalises its serving loop, so a loop captured at __init__
+        # time is not the same loop that handles requests later — caching it
+        # and scheduling Futures/tasks against it produces cross-loop
+        # ``attached to a different loop`` RuntimeErrors. Always resolve the
+        # running loop at call time via ``asyncio.get_running_loop()``.
         self._errors = []
         self._loaded_plugins = []  # all plugins that were loaded, including disabled ones
 
@@ -72,18 +77,22 @@ class AppService(AppServiceInterface, BaseService):
         # concurrently while operations run, and handing the live references
         # to the executor risks RuntimeError mid-iteration under load.
         link_groups = [list(op.chain) for op in operations] + [list(a.links) for a in agents]
-        return await self.loop.run_in_executor(None, self._check_links_for_match, unique, link_groups)
+        # Use the *running* loop, not self.loop (captured at __init__ time, which
+        # predates aiohttp's serving loop and produces cross-loop Future errors).
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self._check_links_for_match, unique, link_groups)
 
     async def find_op_with_link(self, link_id):
         """
         Retrieves the operation that a link_id belongs to. Will search currently running
         operations first.
         """
+        loop = asyncio.get_running_loop()
         operations = await self.get_service('data_svc').locate('operations', match=dict(state='running'))
-        op = await self.loop.run_in_executor(None, self._find_op_with_link, operations, link_id)
+        op = await loop.run_in_executor(None, self._find_op_with_link, operations, link_id)
         if not op:
             operations = await self.get_service('data_svc').locate('operations', match=dict())
-            op = await self.loop.run_in_executor(None, self._find_op_with_link, operations, link_id)
+            op = await loop.run_in_executor(None, self._find_op_with_link, operations, link_id)
         return op
 
     async def run_scheduler(self):
@@ -111,13 +120,13 @@ class AppService(AppServiceInterface, BaseService):
                     sop.set_start_details()
                     await sop.update_operation_agents(self.get_services())
                     await self._services.get('data_svc').store(sop)
-                    self.loop.create_task(sop.run(self.get_services()))
+                    asyncio.get_running_loop().create_task(sop.run(self.get_services()))
             await asyncio.sleep(interval)
 
     async def resume_operations(self):
         await asyncio.sleep(10)
         for op in await self.get_service('data_svc').locate('operations', match=dict(finish=None)):
-            self.loop.create_task(op.run(self.get_services()))
+            asyncio.get_running_loop().create_task(op.run(self.get_services()))
 
     async def load_plugins(self, plugins):
         def trim(p):
@@ -246,11 +255,12 @@ class AppService(AppServiceInterface, BaseService):
     async def _write_reports(self):
         file_svc = self.get_service('file_svc')
         r_dir = await file_svc.create_exfil_sub_directory('%s/reports' % self.get_config('reports_dir'))
-        report = await self.loop.run_in_executor(None, lambda: json.dumps(dict(self.get_service('contact_svc').report)).encode())
+        loop = asyncio.get_running_loop()
+        report = await loop.run_in_executor(None, lambda: json.dumps(dict(self.get_service('contact_svc').report)).encode())
         await file_svc.save_file('contact_reports', report, r_dir)
         for op in await self.get_service('data_svc').locate('operations'):
             operation_report = await op.report(self.get_service('file_svc'), self.get_service('data_svc'))
-            report = await self.loop.run_in_executor(None, lambda: json.dumps(operation_report).encode())
+            report = await loop.run_in_executor(None, lambda: json.dumps(operation_report).encode())
             if report:
                 await file_svc.save_file('operation_%s' % op.id, report, r_dir)
 

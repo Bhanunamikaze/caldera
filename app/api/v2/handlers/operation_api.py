@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 import aiohttp_apispec
 
 from aiohttp import web
@@ -13,11 +14,55 @@ from app.objects.c_operation import Operation, OperationSchema, OperationSchemaA
 from app.objects.secondclass.c_link import LinkSchema
 
 
+# Short TTL so the UI still feels live, long enough to absorb the typical
+# 1-2 second poll cadence of multiple browser tabs/users.
+_SUMMARY_CACHE_TTL_SECONDS = 2.0
+
+
+class _TTLResponseCache:
+    """TTL cache + in-flight deduplication for expensive JSON responses.
+
+    All state mutations happen on the asyncio event loop thread, so no
+    locking is required: a check-then-set sequence cannot be preempted
+    mid-statement. Concurrent requests for the same key share a single
+    in-flight computation via a Future — a key win when the SPA polls
+    the same endpoint from multiple tabs/users at once.
+    """
+
+    def __init__(self, ttl):
+        self._ttl = ttl
+        self._entries = {}   # key -> (expires_at_monotonic, payload)
+        self._inflight = {}  # key -> Future awaiting the payload
+
+    async def get(self, key, compute):
+        now = time.monotonic()
+        entry = self._entries.get(key)
+        if entry is not None and entry[0] > now:
+            return entry[1]
+        inflight = self._inflight.get(key)
+        if inflight is not None:
+            return await inflight
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        self._inflight[key] = fut
+        try:
+            payload = await compute()
+        except Exception as e:
+            fut.set_exception(e)
+            self._inflight.pop(key, None)
+            raise
+        self._entries[key] = (now + self._ttl, payload)
+        fut.set_result(payload)
+        self._inflight.pop(key, None)
+        return payload
+
+
 class OperationApi(BaseObjectApi):
     def __init__(self, services):
         super().__init__(description='operation', obj_class=Operation, schema=OperationSchema, ram_key='operations',
                          id_property='id', auth_svc=services['auth_svc'])
         self._api_manager = OperationApiManager(services)
+        self._summary_cache = _TTLResponseCache(_SUMMARY_CACHE_TTL_SECONDS)
 
     def add_routes(self, app: web.Application):
         router = app.router
@@ -76,20 +121,42 @@ class OperationApi(BaseObjectApi):
     @aiohttp_apispec.response_schema(OperationSchemaAlt(many=True, partial=True),
                                      description='The response is a list of all operations.')
     async def get_operations_summary(self, request: web.Request):
-        remove_props = ['chain', 'host_group', 'source', 'visibility']
-        operations = await self.get_all_objects(request)
-        loop = asyncio.get_event_loop()
-        operations_mod = []
-        for op in operations:
-            # get_agents walks the (already-dumped) chain and pulls each
-            # agent's display — also pure-Python CPU. Yield the loop between
-            # operations so a long list doesn't bury other requests.
-            op['agents'] = await loop.run_in_executor(None, self._api_manager.get_agents, op)
-            op['hosts'] = await self._api_manager.get_hosts(op)
-            for prop in remove_props:
-                op.pop(prop, None)
-            operations_mod.append(op)
-        return await self._json_response_async(operations_mod)
+        # Cache the serialized JSON for a couple of seconds, keyed by the
+        # request's access set. The SPA polls this endpoint frequently and,
+        # with multiple tabs/users, would otherwise re-run the (still heavy)
+        # serialization for every poll — the same work hundreds of times a
+        # minute. With this cache, concurrent polls share one computation
+        # and subsequent polls within the TTL hit memory.
+        access = await self.get_request_permissions(request)
+        cache_key = self._summary_cache_key(access)
+
+        async def _compute():
+            remove_props = ['chain', 'host_group', 'source', 'visibility']
+            operations = await self.get_all_objects(request)
+            loop = asyncio.get_running_loop()
+            operations_mod = []
+            for op in operations:
+                op['agents'] = await loop.run_in_executor(None, self._api_manager.get_agents, op)
+                op['hosts'] = await self._api_manager.get_hosts(op)
+                for prop in remove_props:
+                    op.pop(prop, None)
+                operations_mod.append(op)
+            return await loop.run_in_executor(
+                None, lambda: json.dumps(operations_mod, ensure_ascii=True, default=str))
+
+        body = await self._summary_cache.get(cache_key, _compute)
+        return web.Response(text=body, content_type='application/json')
+
+    @staticmethod
+    def _summary_cache_key(access):
+        # access is a dict like {'access': {Access.RED, Access.APP}, ...};
+        # convert to a hashable form. Sort by string repr so equal sets
+        # always produce the same key regardless of insertion order.
+        access_levels = access.get('access') if isinstance(access, dict) else access
+        try:
+            return tuple(sorted(repr(a) for a in (access_levels or ())))
+        except TypeError:
+            return repr(access)
 
     @aiohttp_apispec.docs(tags=['operations'],
                           summary='Create a new Caldera operation record',
