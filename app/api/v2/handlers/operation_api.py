@@ -7,11 +7,12 @@ from aiohttp import web
 
 from app.api.v2.handlers.base_object_api import BaseObjectApi
 from app.api.v2.managers.operation_api_manager import OperationApiManager
-from app.api.v2.responses import JsonHttpNotFound
+from app.api.v2.responses import JsonHttpForbidden, JsonHttpNotFound
 from app.api.v2.schemas.base_schemas import BaseGetAllQuerySchema, BaseGetOneQuerySchema
 from app.api.v2.schemas.link_result_schema import LinkResultSchema
 from app.objects.c_operation import Operation, OperationSchema, OperationSchemaAlt, OperationOutputRequestSchema
 from app.objects.secondclass.c_link import LinkSchema
+from app.utility.base_world import BaseWorld
 
 
 # Short TTL so the UI still feels live, long enough to absorb the typical
@@ -68,7 +69,10 @@ class OperationApi(BaseObjectApi):
         router = app.router
         router.add_get('/operations', self.get_operations)
         router.add_get('/operations/summary', self.get_operations_summary)
+        # Registered before /operations/{id} so 'metadata' is not captured as an id.
+        router.add_get('/operations/metadata', self.get_operations_metadata)
         router.add_get('/operations/{id}', self.get_operation_by_id)
+        router.add_get('/operations/{id}/summary', self.get_operation_summary)
         router.add_post('/operations', self.create_operation)
         router.add_patch('/operations/{id}', self.update_operation)
         router.add_delete('/operations/{id}', self.delete_operation)
@@ -146,6 +150,80 @@ class OperationApi(BaseObjectApi):
 
         body = await self._summary_cache.get(cache_key, _compute)
         return web.Response(text=body, content_type='application/json')
+
+    @aiohttp_apispec.docs(tags=['operations'],
+                          summary='Retrieve lightweight metadata for all operations',
+                          description='Returns only scalar operation fields plus chain/host counts. Does not '
+                                      'serialize link chains, agents or sources, so it stays fast regardless of '
+                                      'how many links the operations contain. Use GET /operations/{id} to load '
+                                      'the full operation.')
+    async def get_operations_metadata(self, request: web.Request):
+        access = await self.get_request_permissions(request)
+        operations = [self._operation_metadata(op)
+                      for op in self._api_manager.find_objects(self.ram_key, access)]
+        operations.sort(key=lambda o: o.get('name') or '')
+        return web.json_response(operations)
+
+    @aiohttp_apispec.docs(tags=['operations'],
+                          summary='Retrieve graph summary (agents/hosts) for one operation',
+                          description='Same shape as one element of GET /operations/summary, but computed '
+                                      'for a single operation only.',
+                          parameters=[{
+                              'in': 'path',
+                              'name': 'id',
+                              'schema': {'type': 'string'},
+                              'required': 'true',
+                              'description': 'UUID of the Operation.'
+                          }])
+    async def get_operation_summary(self, request: web.Request):
+        operation_id = request.match_info.get('id')
+        access = await self.get_request_permissions(request)
+        operation = self._api_manager.find_object(self.ram_key, {'id': operation_id})
+        if not operation:
+            raise JsonHttpNotFound(f'Operation not found: {operation_id}')
+        if operation.access not in access['access']:
+            raise JsonHttpForbidden(f'Cannot view operation due to insufficient permissions: {operation_id}')
+
+        def _build_agents():
+            op_dict = {'chain': [lnk.display for lnk in list(operation.chain)]}
+            return op_dict, self._api_manager.get_agents(op_dict)
+
+        loop = asyncio.get_running_loop()
+        op_dict, agents = await loop.run_in_executor(None, _build_agents)
+        summary = self._operation_metadata(operation)
+        summary['agents'] = agents
+        summary['hosts'] = await self._api_manager.get_hosts(op_dict)
+        return await self._json_response_async(summary)
+
+    @staticmethod
+    def _operation_metadata(op):
+        def _ref(obj, id_attr):
+            if obj is None:
+                return None
+            return {id_attr: getattr(obj, id_attr, None), 'name': getattr(obj, 'name', None)}
+
+        start = op.start
+        if start is not None and not isinstance(start, str):
+            start = start.strftime(BaseWorld.TIME_FORMAT)
+        return {
+            'id': op.id,
+            'name': op.name,
+            'state': op.state,
+            'start': start,
+            'finish': op.finish,
+            'group': op.group,
+            'autonomous': op.autonomous,
+            'obfuscator': op.obfuscator,
+            'jitter': op.jitter,
+            'auto_close': op.auto_close,
+            'visibility': op.visibility,
+            'use_learning_parsers': op.use_learning_parsers,
+            'adversary': _ref(op.adversary, 'adversary_id'),
+            'planner': _ref(op.planner, 'planner_id'),
+            'source': _ref(op.source, 'id'),
+            'chain_length': len(op.chain),
+            'agent_count': len(op.agents or []),
+        }
 
     @staticmethod
     def _summary_cache_key(access):

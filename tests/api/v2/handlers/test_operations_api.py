@@ -55,6 +55,44 @@ class TestOperationsApi:
         assert 'chain' not in operation_dict
         assert 'host_group' not in operation_dict
 
+    async def test_get_operations_metadata(self, api_v2_client, api_cookies, test_operation):
+        resp = await api_v2_client.get('/api/v2/operations/metadata', cookies=api_cookies)
+        assert resp.status == HTTPStatus.OK
+        operations_list = await resp.json()
+        assert len(operations_list) == 1
+        op = operations_list[0]
+        assert op['id'] == test_operation['id']
+        assert op['name'] == test_operation['name']
+        assert op['state'] == test_operation['state']
+        assert op['group'] == test_operation['group']
+        assert op['chain_length'] == 2
+        assert op['agent_count'] == 1
+        assert op['adversary'] == {'adversary_id': test_operation['adversary']['adversary_id'],
+                                   'name': test_operation['adversary']['name']}
+        assert op['planner']['name'] == test_operation['planner']['name']
+        assert op['source']['name'] == test_operation['source']['name']
+        assert op['start']
+        for heavy in ('chain', 'host_group', 'objective'):
+            assert heavy not in op
+
+    async def test_unauthorized_get_operations_metadata(self, api_v2_client):
+        resp = await api_v2_client.get('/api/v2/operations/metadata')
+        assert resp.status == HTTPStatus.UNAUTHORIZED
+
+    async def test_get_operation_summary_by_id(self, api_v2_client, api_cookies, test_operation):
+        resp = await api_v2_client.get(f'/api/v2/operations/{test_operation["id"]}/summary', cookies=api_cookies)
+        assert resp.status == HTTPStatus.OK
+        op = await resp.json()
+        assert op['id'] == test_operation['id']
+        assert '123' in op['agents']
+        assert len(op['agents']['123']['links']) == 2
+        assert op['hosts']
+        assert 'chain' not in op
+
+    async def test_nonexistent_get_operation_summary_by_id(self, api_v2_client, api_cookies):
+        resp = await api_v2_client.get('/api/v2/operations/999/summary', cookies=api_cookies)
+        assert resp.status == HTTPStatus.NOT_FOUND
+
     async def test_get_operations_summary_links_with_no_paw_skipped(
             self, api_v2_client, api_cookies, test_operation):
         """Regression test for issue #3181: links with missing/null paw must not cause HTTP 500."""
